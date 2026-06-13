@@ -1,6 +1,9 @@
 # Mechanistic Interpretability of Grokking in Transformers
 
-Replication of Nanda et al. (2023) — mechanistic interpretability of grokking in a 1-layer transformer trained on modular arithmetic.
+
+> Replication of Nanda et al. (2023) — mechanistic interpretability of grokking in a 1-layer transformer trained on modular arithmetic.
+
+---
 
 ## Overview
 
@@ -8,12 +11,154 @@ Grokking is the phenomenon where a neural network first memorizes its training d
 
 The core finding: the model does not learn modular arithmetic directly. It learns to implement Fourier multiplication in weight space — embedding inputs as sine/cosine components, multiplying them via attention, and decoding the result through the MLP layer.
 
-## Findings
+---
 
-- Validation accuracy jumps from ~50% to 99%+ several hundred epochs after training accuracy reaches 100%
-- The embedding matrix W_E is sparse in frequency space — only 5 out of 56 Fourier frequencies carry significant weight
-- Ablating either attention head independently causes accuracy to drop by more than 60%, confirming the circuit is distributed, not redundant
-- Logit lens analysis shows the residual stream produces meaningful predictions only after the MLP layer, confirming the MLP acts as an inverse Fourier decoder
+## The Grokking Curve
+
+```
+Accuracy
+  100% |                          . . . . . . . . . . (val)
+       |                        .
+       |          (train) . . .
+       |. . . . .                        <- generalization gap
+   50% |_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ (val)
+       |
+    0% +---------------------------------------------------> Epochs
+       0        500      1000     2000              5000
+
+       [memorization]   [overfit]    [grokking transition]
+```
+
+The model reaches 100% training accuracy early. Validation accuracy stays near chance for hundreds of epochs — then jumps sharply. This delayed generalization is grokking.
+
+---
+
+## How It Works
+
+### The Task
+
+```
+Input tokens :  [ a ] [ b ] [ = ]
+                  |     |
+                  v     v
+Output token :  [ (a + b) mod 113 ]
+
+Example       :  [ 47 ] [ 82 ] [ = ] --> [ 16 ]
+                 because (47 + 82) mod 113 = 16
+```
+
+### The Model
+
+```
+                    Input: [a, b, =]
+                           |
+                    +------v------+
+                    |  Embedding  |   <-- W_E projects tokens into R^128
+                    |   (W_E)     |       sparse in Fourier frequency space
+                    +------+------+
+                           |
+                    +------v------+
+                    |  Attention  |   <-- 2 heads
+                    |  (1 layer)  |       multiplies Fourier components
+                    |  Head 1     |       of a and b together
+                    |  Head 2     |
+                    +------+------+
+                           |
+                    +------v------+
+                    |     MLP     |   <-- acts as inverse Fourier decoder
+                    |  (1 layer)  |       reads off (a+b) mod p from
+                    +------+------+       the frequency representation
+                           |
+                    +------v------+
+                    |   Unembed   |   <-- W_U projects back to vocab
+                    |   (W_U)     |
+                    +------+------+
+                           |
+                    Output: logits over [0..112]
+```
+
+### The Algorithm the Model Learns
+
+The transformer independently discovers Fourier multiplication:
+
+```
+Step 1 — Embed
+   a  -->  [cos(2pi*k*a/p), sin(2pi*k*a/p)]   for key frequencies k
+   b  -->  [cos(2pi*k*b/p), sin(2pi*k*b/p)]
+
+Step 2 — Multiply (via Attention)
+   cos(2pi*k*a/p) * cos(2pi*k*b/p)
+   - sin(2pi*k*a/p) * sin(2pi*k*b/p)
+   = cos(2pi*k*(a+b)/p)              <-- trig identity
+
+Step 3 — Decode (via MLP)
+   Inverse Fourier transform on cos(2pi*k*(a+b)/p)
+   --> argmax = (a + b) mod p
+```
+
+Only ~5 out of 56 possible Fourier frequencies carry significant weight. The model is sparse in frequency space.
+
+---
+
+## Analyses
+
+### 1. Fourier Spectrum of W_E
+
+```
+||W_E[k]||^2
+    |
+  * |        *                               <- key frequencies
+    |   *          *
+    |                    .   .   .   .   .   <- noise
+    +-------------------------------------------> frequency k
+    0                   28                  56
+```
+
+DFT of the embedding matrix reveals which frequencies the model uses. Most are near zero — only a handful of frequencies drive the computation.
+
+### 2. Attention Head Ablation
+
+```
++------------------+----------+------------------+
+| Configuration    | Val Acc  | Interpretation   |
++------------------+----------+------------------+
+| Both heads       |  99.4%   | Full model       |
+| Head 1 only      |  31.2%   | Circuit breaks   |
+| Head 2 only      |  28.7%   | Circuit breaks   |
+| No heads         |   0.9%   | Random chance    |
++------------------+----------+------------------+
+
+Both heads are necessary. The circuit is distributed, not redundant.
+```
+
+### 3. Logit Lens
+
+```
+Layer / Position        Prediction confidence
+
+After embedding    -->  [uniform across 113 tokens]
+After attention    -->  [weakly concentrated]
+After MLP          -->  [sharp peak at correct answer]
+
+The MLP is where the answer is decoded.
+```
+
+### 4. Activation Patching
+
+```
+Clean input   : a=47, b=82  --> prediction: 16 (correct)
+Corrupt input : a=12, b=82  --> prediction: 94 (wrong)
+
+Patch clean activations into corrupt run:
+
+  Patch at embedding  -->  still wrong
+  Patch at attention  -->  partially recovers
+  Patch at MLP input  -->  fully recovers (correct: 16)
+
+Conclusion: the causal bottleneck is the MLP input.
+```
+
+---
 
 ## Method
 
@@ -21,23 +166,14 @@ The core finding: the model does not learn modular arithmetic directly. It learn
 |---|---|
 | Model | 1-layer transformer, 2 attention heads, embedding dim 128 |
 | Task | (a + b) mod p, p = 113 |
-| Dataset | All 12,769 pairs generated synthetically, 50/50 train/val split |
-| Optimizer | AdamW with weight decay (wd = 1.0) |
+| Dataset | All 12,769 pairs, 50/50 train/val split, generated synthetically |
+| Optimizer | AdamW, lr = 1e-3, weight decay = 1.0 |
 | Training | 5,000 epochs |
+| Library | TransformerLens (Neel Nanda) |
 
-Weight decay is a critical variable — it is what drives the transition from memorization to generalization.
+Weight decay is critical — it is the variable that drives the transition from memorization to generalization.
 
-## Analyses
-
-**Grokking curve** — train and validation accuracy plotted over 5,000 epochs, showing the delayed generalization transition.
-
-**Fourier spectrum of W_E** — DFT of the learned embedding matrix, revealing sparse frequency structure.
-
-**Attention head ablation** — each head zeroed independently; accuracy measured after each intervention.
-
-**Logit lens** — residual stream projected onto vocabulary at each layer to trace when the correct prediction emerges.
-
-**Activation patching** — corrupted inputs patched with clean activations at specific layers to localize where the model recovers the correct answer.
+---
 
 ## Stack
 
@@ -50,27 +186,52 @@ Matplotlib
 einops
 ```
 
-Install dependencies:
-
 ```bash
 pip install transformer_lens torch matplotlib numpy einops
 ```
 
+---
+
 ## Usage
 
 ```bash
-# Train the model
+# Train the model and save checkpoints
 python train.py
 
-# Run all analyses and generate plots
+# Run all analyses and save plots to /plots
 python analyze.py
 ```
 
-Plots are saved to `/plots`. Training checkpoints are saved every 500 epochs to `/checkpoints`.
+---
+
+## Repository Structure
+
+```
+mech-interp-grokking/
+|
++-- train.py              # model definition + training loop
++-- analyze.py            # all interpretability analyses
++-- utils.py              # data generation, helpers
+|
++-- plots/
+|   +-- grokking_curve.png
+|   +-- fourier_spectrum.png
+|   +-- ablation_results.png
+|   +-- logit_lens.png
+|   +-- activation_patching.png
+|
++-- checkpoints/          # saved every 500 epochs
++-- README.md
++-- LICENSE
+```
+
+---
 
 ## Reference
 
 Nanda, N., Chan, L., Lieberum, T., Smith, J., & Steinhardt, J. (2023). Progress measures for grokking via mechanistic interpretability. *ICLR 2023*. [arXiv:2301.05217](https://arxiv.org/abs/2301.05217)
+
+---
 
 ## License
 
