@@ -1,0 +1,39 @@
+# Grokking transformer config — based on Nanda et al.
+# "Progress measures for grokking via mechanistic interpretability" (2023)
+# Task: modular addition  (a + b) mod p
+
+# --- Task / data ---
+data:
+  p: 113                  # modulus (prime)
+  operation: "addition"   # (a + b) mod p
+
+# --- Model (1-layer, attention-only-ish transformer) ---
+model:
+  n_layers: 1
+  d_model: 128
+  d_mlp: 512              # 4 * d_model
+  d_head: 64
+  n_heads: 2
+  n_ctx: 3               # tokens:  a, b, "="
+  d_vocab: 114           # p numbers (0..112) + 1 "=" token
+  act_fn: "relu"
+  normalization_type: null   # no LayerNorm (matches original setup)
+
+# --- Optimizer ---
+optimizer:
+  name: "AdamW"
+  lr: 1.0e-3
+  weight_decay: 1.0       # high weight decay is key to inducing grokking
+  betas: [0.9, 0.98]
+
+# --- Training ---
+training:
+  num_epochs: 40000       # full-batch; grokking emerges late (~10k+)
+  batch_size: null        # null = full-batch gradient descent
+  device: "cuda"          # falls back to "cpu" if unavailable
+
+# --- Logging / checkpoints ---
+logging:
+  log_every: 100
+  checkpoint_every: 1000
+  save_dir: "checkpoints"
